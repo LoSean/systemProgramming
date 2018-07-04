@@ -1,0 +1,913 @@
+#include "csiebox_client.h"
+
+#include "csiebox_common.h"
+#include "connect.h"
+#include "hash.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <string.h>
+#include <dirent.h>
+#include <libgen.h>
+#include <linux/inotify.h>
+#include <utime.h>
+#define MAXPATH 512
+#define MAXCONTENT 4096
+#define EVENT_SIZE (sizeof(struct inotify_event))
+#define EVENT_BUF_LEN (1024 * (EVENT_SIZE + 16))
+#define DIR_S_FLAG (S_IRWXU | S_IRGRP | S_IXGRP | S_IROTH | S_IXOTH)
+
+static void handle_request(csiebox_client *client);
+static int parse_arg(csiebox_client* client, int argc, char** argv);
+static int login(csiebox_client* client);
+static int originalLen;
+
+struct inodePathTable{
+	char path[MAXPATH];
+	struct inodePathTable *next;
+};
+
+struct inodeTable{
+	ino_t inoNum;
+	struct inodeTable *next;
+	struct inodePathTable *access;
+};
+
+static struct inodeTable inoHead;
+
+static int findPathMatch(char *pathTmp, struct inodeTable *Trav, char *getpath){
+	struct inodePathTable *pathTrav = Trav->access, *last = Trav->access;
+	int noMatch = 1, stop = 0;
+	struct stat statBuf;
+	fprintf(stderr, "traversing in findPathMatch...\n");
+	while(pathTrav != NULL && !stop){
+		fprintf(stderr, "pathTrav->path : %s\n", pathTrav->path);
+		if(lstat(pathTrav->path, &statBuf) >= 0){
+			fprintf(stderr, "[findPathMatch] string %s find success.\n", pathTrav->path);
+			noMatch = 0;
+			stop = 1;
+			strcpy(getpath, pathTrav->path);
+//			last = pathTrav;
+//			pathTrav = pathTrav->next;
+		}
+			last = pathTrav;
+			pathTrav = pathTrav->next;
+/*		else{
+			if (last != NULL)
+				last->next = pathTrav->next;
+			struct inodePathTable *deletePath = pathTrav;
+			pathTrav = pathTrav->next;
+			free(deletePath);
+		}
+*/	}
+	if(noMatch){
+		struct inodePathTable *tmp;	
+		tmp = (struct inodePathTable *)malloc(sizeof(struct inodePathTable));
+		memset(tmp, 0, sizeof(struct inodePathTable));
+		strcpy(tmp->path, pathTmp);
+		last->next = tmp;
+	}
+	if(stop)
+		return 1;
+	else
+		return 0;
+}
+
+static int inoTest(char *pathTmp, struct stat statBuf, char *getpath){
+	struct inodeTable *Trav = &inoHead, *last;
+	int noMatch = 1, stop = 0, find = 0;
+	fprintf(stderr, "traversing in inoTest...\n");
+	while(Trav != NULL && !stop){
+		fprintf(stderr, "[inoTest] inode number : %d\n", (int)Trav->inoNum);
+		if(Trav->inoNum == statBuf.st_ino){
+			fprintf(stderr, "[inoTest] inode num %d find success\n", (int)Trav->inoNum);
+			if(findPathMatch(pathTmp, Trav, getpath))
+				find = 1;
+			noMatch = 0;
+			stop = 1;
+		}
+		last = Trav;
+		Trav = Trav->next;
+	}
+	if(noMatch){
+		struct inodeTable *inoTmp;
+		inoTmp = (struct inodeTable *)malloc(sizeof(struct inodeTable));
+		memset(inoTmp, 0, sizeof(struct inodeTable));
+		if(last == NULL){
+			fprintf(stderr, "[inoTest] *last is NULL\n");
+			exit(1);
+		}
+		inoTmp->inoNum = statBuf.st_ino;
+		last->next = inoTmp;
+		struct inodePathTable *inoPathTmp;
+		inoPathTmp = (struct inodePathTable *)malloc(sizeof(struct inodePathTable));
+		memset(inoPathTmp, 0, sizeof(struct inodePathTable));
+		strcpy(inoPathTmp->path, pathTmp);
+		inoTmp->access = inoPathTmp;
+	}
+	if(find)
+		return 1;
+	else
+		return 0;
+}
+
+//read config file, and connect to server
+void csiebox_client_init(
+		csiebox_client** client, int argc, char** argv) {
+	csiebox_client* tmp = (csiebox_client*)malloc(sizeof(csiebox_client));
+	if (!tmp) {
+		fprintf(stderr, "client malloc fail\n");
+		return;
+	}
+	memset(tmp, 0, sizeof(csiebox_client));
+	if (!parse_arg(tmp, argc, argv)) {
+		fprintf(stderr, "Usage: %s [config file]\n", argv[0]);
+		free(tmp);
+		return;
+	}
+	int fd = client_start(tmp->arg.name, tmp->arg.server);
+	if (fd < 0) {
+		fprintf(stderr, "connect fail\n");
+		free(tmp);
+		return;
+	}
+	tmp->conn_fd = fd;
+	*client = tmp;
+}
+
+static char *fullPath;
+static size_t pathLen;
+static int deepest;
+static char longestPath[MAXPATH];
+static hash hashTable;
+
+static int syncHardLink(char *srcPath, char *targetPath, csiebox_client *client){
+	csiebox_protocol_hardlink hardlink;
+	memset(&hardlink, 0, sizeof(hardlink));
+	hardlink.message.header.req.magic = CSIEBOX_PROTOCOL_MAGIC_REQ;
+	hardlink.message.header.req.op = CSIEBOX_PROTOCOL_OP_SYNC_HARDLINK;
+	hardlink.message.header.req.datalen = sizeof(hardlink) - sizeof(hardlink.message.header);
+	hardlink.message.body.srclen = strlen(&srcPath[originalLen]);
+	hardlink.message.body.targetlen = strlen(&targetPath[originalLen]);
+
+	if (!send_message(client->conn_fd, &hardlink, sizeof(hardlink))) {
+		fprintf(stderr, "[hardlink]send fail\n");
+		return 0;
+	}
+	fprintf(stderr, "send 1 success\n");	
+	if (!send_message(client->conn_fd, &srcPath[originalLen], strlen(&srcPath[originalLen]))){
+		fprintf(stderr, "[hardlink]srcpath name send failed\n");
+		return 0;
+	}
+	fprintf(stderr, "send 2 success\n");	
+	if (!send_message(client->conn_fd, &targetPath[originalLen], strlen(&targetPath[originalLen]))){
+		fprintf(stderr, "[hardlink]targetpath name send failed\n");
+		return 0;
+	}
+	fprintf(stderr, "send 3 success\n");	
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	if (recv_message(client->conn_fd, &header, sizeof(header))){
+		if(header.res.magic == CSIEBOX_PROTOCOL_MAGIC_RES &&
+		        header.res.op == CSIEBOX_PROTOCOL_OP_SYNC_HARDLINK &&
+			header.res.status == CSIEBOX_PROTOCOL_STATUS_OK){
+			return 1;
+		}
+		else{
+			return 0;
+		}
+	}
+
+	return 0;
+}
+
+static int syncRm(char *pathTmp, csiebox_client *client){
+	csiebox_protocol_rm rm;
+	memset(&rm, 0, sizeof(rm));
+	rm.message.header.req.magic = CSIEBOX_PROTOCOL_MAGIC_REQ;
+	rm.message.header.req.op = CSIEBOX_PROTOCOL_OP_RM;
+	rm.message.header.req.datalen = sizeof(rm) - sizeof(rm.message.header);
+	rm.message.body.pathlen = strlen(pathTmp) - originalLen;
+	fprintf(stderr, "[syncRm] pathTmp : %s\n", pathTmp);
+	fprintf(stderr, "[syncRm] rm.message.body.pathlen : %d\n", rm.message.body.pathlen);
+	if (!send_message(client->conn_fd, &rm, sizeof(rm))) {
+		fprintf(stderr, "[syncRm]send fail\n");
+		return 0;
+	}
+	
+	if (!send_message(client->conn_fd, &pathTmp[originalLen], rm.message.header.req.datalen)){
+		fprintf(stderr, "[syncRm]path name send failed\n");
+		return 0;
+	}
+	fprintf(stderr, "[syncRm] send path success\n");
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	if (recv_message(client->conn_fd, &header, sizeof(header))){
+		fprintf(stderr, "[syncRm] recv\n");
+		if(header.res.magic == CSIEBOX_PROTOCOL_MAGIC_RES &&
+		        header.res.op == CSIEBOX_PROTOCOL_OP_RM &&
+			header.res.status == CSIEBOX_PROTOCOL_STATUS_OK){
+			return 1;
+		}
+		else{
+			return 0;
+		}
+	}
+	return 0;
+}
+
+static int syncFile(char *pathTmp, struct stat statBuf, csiebox_client *client){
+	csiebox_protocol_file file;
+	memset(&file, 0, sizeof(file));
+	file.message.header.req.magic = CSIEBOX_PROTOCOL_MAGIC_REQ;
+	file.message.header.req.op = CSIEBOX_PROTOCOL_OP_SYNC_FILE;
+	file.message.header.req.datalen = sizeof(file) - sizeof(file.message.header);
+	
+	char contentBuf[MAXCONTENT];
+	memset(contentBuf, 0, MAXCONTENT);
+	if(S_ISLNK(statBuf.st_mode)){
+		fprintf(stderr, "[syncFile] soft link .\n");
+		readlink(pathTmp, contentBuf, MAXCONTENT);
+		file.message.body.datalen = strlen(contentBuf);
+		fprintf(stderr, "[syncFile] %s %d\n", contentBuf, strlen(contentBuf));
+	}
+	else{
+		int fd = open(pathTmp, O_RDONLY);
+		if (fd < 0)
+			return 0;
+		file.message.body.datalen = read(fd, contentBuf, MAXCONTENT);
+		close(fd);
+	}
+	fprintf(stderr, "[syncFile]file %s length : %d\n", pathTmp, file.message.body.datalen);
+	if(!send_message(client->conn_fd, &file, sizeof(file))){
+		fprintf(stderr, "[syncFile]send failed.\n");	
+		return 0;
+	}
+	if(file.message.body.datalen == 0){
+		fprintf(stderr, "[syncFile] file no content.\n");
+		return 1;
+	}
+	if (!send_message(client->conn_fd, contentBuf, file.message.body.datalen)){
+		fprintf(stderr, "[syncFile]file content send failed\n");
+		return 0;
+	}
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	if (recv_message(client->conn_fd, &header, sizeof(header))){
+		if(header.res.magic == CSIEBOX_PROTOCOL_MAGIC_RES &&
+		        header.res.op == CSIEBOX_PROTOCOL_OP_SYNC_FILE &&
+			header.res.status == CSIEBOX_PROTOCOL_STATUS_OK){
+			return 1;
+		}
+		else{
+			return 0;
+		}
+	}
+	return 0;
+}
+
+static int syncMeta(char *pathTmp, struct stat statBuf, csiebox_client *client){
+	csiebox_protocol_meta meta;
+	memset(&meta, 0, sizeof(meta));
+	meta.message.header.req.magic = CSIEBOX_PROTOCOL_MAGIC_REQ;
+	meta.message.header.req.op = CSIEBOX_PROTOCOL_OP_SYNC_META;
+	meta.message.header.req.datalen = sizeof(meta) - sizeof(meta.message.header);
+	meta.message.body.pathlen = strlen(pathTmp) - originalLen;
+	printf("[syncMeta]meta.message.body.pathlen = %d\n", meta.message.body.pathlen);
+	printf("[syncMeta]path in meta : %s\n", &pathTmp[originalLen]);
+	memcpy(&meta.message.body.stat, &statBuf, sizeof(statBuf));
+	if(S_ISREG(statBuf.st_mode)){
+		if(!md5_file(pathTmp, meta.message.body.hash)){
+			fprintf(stderr, "[syncMeta]file md5 failed\n");
+			exit(1);
+		}
+	}
+	if (!send_message(client->conn_fd, &meta, sizeof(meta))) {
+		fprintf(stderr, "[syncMeta]send fail\n");
+		return 0;
+	}
+	
+	if (!send_message(client->conn_fd, &pathTmp[originalLen], strlen(&pathTmp[originalLen]))){
+		fprintf(stderr, "[syncMeta]path name send failed\n");
+		return 0;
+	}
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	if (recv_message(client->conn_fd, &header, sizeof(header))){
+		fprintf(stderr, "[syncMeta] recv success\n");
+			fprintf(stderr, "[reSyncMeta] STATUS_FAIL\n");
+		if(header.res.magic == CSIEBOX_PROTOCOL_MAGIC_RES &&
+		        header.res.op == CSIEBOX_PROTOCOL_OP_SYNC_META &&
+		        header.res.status != CSIEBOX_PROTOCOL_STATUS_FAIL){
+			if(header.res.status == CSIEBOX_PROTOCOL_STATUS_OK)
+				return 1;
+			else if(header.res.status == CSIEBOX_PROTOCOL_STATUS_MORE){
+				fprintf(stderr, "[syncMeta] syncFile\n");
+				if(syncFile(pathTmp, statBuf, client)){			
+					return 1;
+				}
+				else{
+					fprintf(stderr, "[syncMeta] fail to syncFile\n");
+					return 0;
+				}
+			}
+			else{
+				return 0;
+			}
+		}
+		else{
+			fprintf(stderr, "[syncMeta] magic : %d\nop : %d\n status %d\n", header.res.magic, 
+					header.res.op, header.res.status);
+			return 0;
+		}
+	}
+	fprintf(stderr, "[syncMeta] recv fail\n");
+	return 0;
+}
+
+void dotrav(int layer, const int fd, csiebox_client *client){
+	struct stat statBuf;
+	if(lstat(fullPath, &statBuf) < 0){
+		fprintf(stderr, "lstat error\n");
+		exit(1);
+	}
+	if(S_ISDIR(statBuf.st_mode) == 0){
+		fprintf(stderr, "%s is not a directory\n", basename(fullPath));
+		char getpath[MAXPATH];
+		memset(getpath, 0, MAXPATH);
+		if(inoTest(fullPath, statBuf, getpath)){
+			fprintf(stderr, "[dotrav] hard link found : %s\n", getpath);
+			if(!syncHardLink(fullPath, getpath, client)){
+				fprintf(stderr, "syncHardLink in traverse failed\n");
+				exit(1);
+			}
+			fprintf(stderr, "[dotrav] hard link success.\n");
+		}
+		else{
+			fprintf(stderr, "[dotrav] hard link not found.\n");
+			if(!syncMeta(fullPath, statBuf, client)){
+				fprintf(stderr, "syncMeta in traverse failed\n");
+				exit(1);
+			}
+		}
+		return;
+	}
+
+	struct dirent *dirp;
+	DIR *dp;
+	if((dp = opendir(fullPath)) == NULL){
+		fprintf(stderr, "Cannot open the directory %s\n", basename(fullPath));
+		return;
+	}
+
+	int wd;
+	wd = inotify_add_watch(fd, fullPath, IN_CREATE | IN_DELETE | IN_ATTRIB | IN_MODIFY);
+	char *wdPath = (char *)malloc(MAXPATH);
+	strcpy(wdPath, fullPath);
+	if(!put_into_hash(&hashTable, (void *)wdPath, wd)){
+		fprintf(stderr, "fail to put into hash\n");
+		exit(1);
+	}
+
+	if(wd > 1){
+		if(!syncMeta(fullPath, statBuf, client)){
+			fprintf(stderr, "sync directory in traverse failed\n");
+			exit(1);
+		}
+	}
+	if(layer > deepest){
+		deepest = layer;
+		strcpy(longestPath, fullPath);
+	}
+	printf("current directory: %s\n", fullPath);
+	int curPathLen = strlen(fullPath);
+	fullPath[curPathLen] = '/';
+	fullPath[curPathLen+1] = '0';
+	while((dirp = readdir(dp)) != NULL){
+		if(strcmp(dirp->d_name, ".") == 0 ||
+				strcmp(dirp->d_name, "..") == 0)
+			continue;
+		if(curPathLen + strlen(dirp->d_name) > pathLen){
+			pathLen *= 2;
+			fullPath = (char *)realloc(fullPath, pathLen);
+		}
+		strcpy(&fullPath[curPathLen+1], dirp->d_name);
+		dotrav(layer+1, fd, client);
+	}
+	closedir(dp);
+	return;
+}
+
+static void syncEnd(csiebox_client *client){
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.req.magic = CSIEBOX_PROTOCOL_MAGIC_REQ;
+	header.req.op = CSIEBOX_PROTOCOL_OP_SYNC_END;
+	send_message(client->conn_fd, &header, sizeof(header));
+}
+
+void traverse(csiebox_client *client, const int fd){
+	originalLen = strlen(client->arg.path);
+	pathLen = MAXPATH;
+	fullPath = (char *)malloc(pathLen);
+	strcpy(fullPath, client->arg.path);
+	deepest = 0;
+	strcpy(longestPath, fullPath);
+	dotrav(0, fd, client);
+	syncEnd(client);
+	sprintf(fullPath, "%s/longestPath.txt", client->arg.path);
+	FILE *wfp = fopen(fullPath, "w");
+	fprintf(wfp, "%s", &longestPath[originalLen+1]);
+	fclose(wfp);
+	return;
+}
+
+void creatNewIno(int fd, int eventWd, char *eventName){
+	char *getHash;
+	if(!get_from_hash(&hashTable, (void **)&getHash, eventWd)){
+		fprintf(stderr, "fail to get from hash\n");
+		exit(1);
+	}
+	printf("path get from hash : %s\n", getHash);
+	int wd;
+	char *wdPath = (char *)malloc(MAXPATH);
+	strcpy(wdPath, getHash);
+	wdPath[strlen(wdPath)] = '/';
+	strcpy(&wdPath[strlen(wdPath)], eventName);
+	printf("dir need to be detected : %s\n", wdPath);
+	wd = inotify_add_watch(fd, wdPath, IN_CREATE | IN_DELETE | IN_ATTRIB | IN_MODIFY);
+
+	if(!put_into_hash(&hashTable, (void *)wdPath, wd)){
+		fprintf(stderr, "fail to put into hash\n");
+		exit(1);
+	}
+	return;
+}
+
+void deleteIno(int fd, int wd){
+	char *getHash;
+	del_from_hash(&hashTable, (void **)&getHash, wd);
+	free(getHash);
+	getHash = NULL;
+	inotify_rm_watch(fd, wd);
+	return;
+}
+
+void doInotify(csiebox_client *client, const int fd){
+	char buffer[EVENT_BUF_LEN];
+	memset(buffer, 0, EVENT_BUF_LEN);
+	int length = read(fd, buffer, EVENT_BUF_LEN);
+	int i = 0;
+	if (length <= 0){
+		fprintf(stderr, "fail to get new event\n");
+		return;
+	}
+	i = 0;
+	while(i < length){
+		fprintf(stderr, "[doInotify] i : %d\n", i);
+		struct inotify_event* event = (struct inotify_event *)&buffer[i];
+		printf("event: (%d, %d, %s)\ntype: ", event->wd, strlen(event->name), event->name);
+		char *pathGet;
+		if(!get_from_hash(&hashTable, (void **)&pathGet, event->wd)){
+			fprintf(stderr, "[update] get from hash failed.\n");
+			exit(1);
+		}
+		char pathTmp[MAXPATH];
+		strcpy(pathTmp, pathGet);
+		sprintf(&pathTmp[strlen(pathTmp)], "/%s", event->name);
+		if (event->mask & IN_IGNORED){     
+			printf("IN_IGNORED ");				
+		}
+		else if (event->mask & IN_DELETE) {
+			printf("delete ");
+			if(!syncRm(pathTmp, client)){
+				fprintf(stderr, "syncRm in update failed\n");
+				exit(1);
+			}
+		}
+		else if (event->mask & IN_CREATE ||
+				event->mask & IN_ATTRIB ||
+				event->mask & IN_MODIFY) {
+			fprintf(stderr, "[update] event->name : %s\n", event->name);
+			struct stat statBuf;
+			if(lstat(pathTmp, &statBuf) < 0){
+				fprintf(stderr, "[update] lstat error.\n");
+				exit(1);
+			}
+
+			char getpath[MAXPATH];
+			if ((event->mask & IN_CREATE) && 
+					S_ISREG(statBuf.st_mode) &&
+					inoTest(pathTmp, statBuf, getpath)){
+				fprintf(stderr, "[dotrav] hard link found : %s\n", getpath);
+				if(!syncHardLink(pathTmp, getpath, client)){
+					fprintf(stderr, "syncHardLink in traverse failed\n");
+					exit(1);
+				}
+				fprintf(stderr, "[dotrav] hard link success.\n");
+			}
+			if (event->mask & IN_ISDIR ||
+					S_ISREG(statBuf.st_mode) ||
+					S_ISLNK(statBuf.st_mode)) {
+				if(!syncMeta(pathTmp, statBuf, client)){
+					fprintf(stderr, "syncMeta in update failed\n");
+					exit(1);
+				}
+			}
+		}
+		if (event->mask & IN_ISDIR) {
+			printf("dir\n");
+			if(event->mask & IN_CREATE){
+				creatNewIno(fd, event->wd, event->name);
+			}
+		} 
+		else {
+			printf("file\n");
+		}
+		i += EVENT_SIZE + event->len;
+	}
+	syncEnd(client);
+}
+
+void update(csiebox_client *client, const int fd){
+	fd_set master;
+	fd_set read_fds;
+	FD_ZERO(&master);
+	FD_ZERO(&read_fds);
+	FD_SET(client->conn_fd, &master);
+	FD_SET(fd, &master);
+	int fdmax = client->conn_fd;
+	if(fd > fdmax)
+		fdmax = fd;
+
+	while(1){
+		read_fds = master;
+		if (select(fdmax+1, &read_fds, NULL, NULL, NULL) == -1){
+			perror("select:");
+			exit(4);	
+		}
+		
+		for(int i = 0; i < fdmax+1; i++){
+			if (FD_ISSET(i, &read_fds)){
+				if(i == client->conn_fd){
+					handle_request(client);
+				}
+				else if(i == fd){
+					doInotify(client, fd);		
+				}
+				else{
+					fprintf(stderr, "incorrect fd\n");
+				}
+			}
+		}
+	}
+	return;
+}
+
+static void reSyncFile(char *pathTmp, csiebox_client *client, struct stat metaBuf){
+	csiebox_protocol_file file;
+	if(!recv_message(client->conn_fd, &file, sizeof(file))){
+		fprintf(stderr, "[reSyncFile] recv file length failed.\n");
+		exit(1);
+	}
+	fprintf(stderr, "[reSyncFile] datalen : %d\n", file.message.body.datalen);
+	if(file.message.body.datalen == 0){
+		return;
+	}
+	char contentTmp[MAXCONTENT];
+	if(!recv_message(client->conn_fd, contentTmp, file.message.body.datalen)){
+		fprintf(stderr, "[reSyncFile] recv file data failed.\n");
+		exit(1);
+	}
+	contentTmp[file.message.body.datalen] = '\0';
+	if(S_ISLNK(metaBuf.st_mode)){
+		symlink(contentTmp, pathTmp);
+	}
+	else{
+		int fd = open(pathTmp, O_WRONLY);
+		if (fd < 0){
+			fprintf(stderr, "[reSyncFile] open file %s failed.\n", pathTmp);	
+			exit(1);
+		}
+		if (write(fd, contentTmp, file.message.body.datalen) <= 0){
+			fprintf(stderr, "[reSyncFile] write data into file failed.\n");
+			exit(1);
+		}
+		close(fd);
+	}
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
+	header.res.op = CSIEBOX_PROTOCOL_OP_SYNC_FILE;
+	header.res.datalen = 0;
+	header.res.status = CSIEBOX_PROTOCOL_STATUS_OK;
+	send_message(client->conn_fd, &header, sizeof(header));
+}
+
+void create(char *pathTmp, struct stat stat, int *order){
+	if(S_ISDIR(stat.st_mode)){
+		printf("%s is a directory\n", pathTmp);
+		mkdir(pathTmp, DIR_S_FLAG);
+		*order = 1;
+	}
+	else if(S_ISLNK(stat.st_mode)){
+		printf("%s is a soft link\n", pathTmp);
+		*order = 2;
+	}
+	else if(S_ISREG(stat.st_mode)){
+		printf("%s is a regular file\n", pathTmp);
+		printf("file size : %d\n", stat.st_size);
+		FILE *wfp = fopen(pathTmp, "w");
+		fclose(wfp);
+		*order = 2;
+	}
+	else{
+		printf("%s unknown\n", pathTmp);
+		*order = 1;
+	}
+}
+
+void syncAttrib(char *pathTmp, struct stat statBuf, struct stat metaBuf){
+	if(S_ISLNK(metaBuf.st_mode)){
+		struct timeval tvp[2];
+		tvp[0].tv_sec = metaBuf.st_atime;
+		tvp[1].tv_sec = metaBuf.st_mtime;
+		tvp[0].tv_usec = tvp[1].tv_usec = 0;
+		lutimes(pathTmp, tvp);
+		return;
+	}
+	if (statBuf.st_mtime != metaBuf.st_mtime||
+			statBuf.st_atime != metaBuf.st_atime){
+		fprintf(stderr, "[syncAttrib] time different\n");
+		struct utimbuf ubuf;
+		memcpy(&ubuf.actime, &metaBuf.st_atime, sizeof(time_t)); 
+		memcpy(&ubuf.modtime, &metaBuf.st_mtime, sizeof(time_t)); 
+		if(utime(pathTmp, &ubuf) == -1){
+			fprintf(stderr, "[syncAttrib] utime() failed.  Reason: %s\n", strerror(errno));
+		}
+	}
+	if (statBuf.st_mode != metaBuf.st_mode){
+		fprintf(stderr, "[syncAttrib] mode different\n");
+		if(chmod(pathTmp, metaBuf.st_mode) < 0){
+			perror("[syncAttrib] mode change failed.\n");
+		}
+	}
+}
+
+static void reSyncMeta(csiebox_client *client, csiebox_protocol_meta* meta){
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
+	header.res.op = CSIEBOX_PROTOCOL_OP_SYNC_META;
+	header.res.datalen = 0;
+
+	char pathTmp[MAXPATH];
+	sprintf(pathTmp, "%s", client->arg.path);
+
+	int reLen = strlen(pathTmp);
+	if (!recv_message(client->conn_fd, &pathTmp[reLen], meta->message.body.pathlen)){
+		fprintf(stderr, "remeta recv file error\n");
+	}
+	pathTmp[reLen+meta->message.body.pathlen] = '\0';
+	struct stat statbuf;
+	int order = 0;
+	if (lstat(pathTmp, &statbuf) < 0){
+		create(pathTmp, meta->message.body.stat, &order);
+	}
+	else{
+		if (S_ISREG(statbuf.st_mode)){
+			char contentTmp[MD5_DIGEST_LENGTH];
+			md5_file(pathTmp, contentTmp);
+			if(!strcmp(contentTmp, meta->message.body.hash)){
+				fprintf(stderr, "meta->message.body.hash %s the same\n", meta->message.body.hash);
+				order = 1;
+			}
+			else{
+				fprintf(stderr, "meta->message.body.hash %s different\n", meta->message.body.hash);
+				order = 2;
+			}
+		}
+		else{
+			order  = 1;
+		}
+	}
+	switch(order){
+		case 0:
+			fprintf(stderr, "[reSyncMeta] STATUS_FAIL\n");
+			header.res.status = CSIEBOX_PROTOCOL_STATUS_FAIL;
+		break;
+		case 1:
+			fprintf(stderr, "[reSyncMeta] STATUS_OK\n");
+			syncAttrib(pathTmp, statbuf, meta->message.body.stat);
+			header.res.status = CSIEBOX_PROTOCOL_STATUS_OK;
+		break;
+		case 2:
+			fprintf(stderr, "[reSyncMeta] STATUS_MORE\n");
+				header.res.status = CSIEBOX_PROTOCOL_STATUS_MORE;
+		break;
+	}
+	send_message(client->conn_fd, &header, sizeof(header));
+	if (header.res.status == CSIEBOX_PROTOCOL_STATUS_MORE){
+		reSyncFile(pathTmp, client, meta->message.body.stat);
+		syncAttrib(pathTmp, statbuf, meta->message.body.stat);
+	}
+}
+
+static void reSyncRm(csiebox_client *client, csiebox_protocol_rm *rm){
+	char pathTmp[MAXPATH];
+	sprintf(pathTmp, "%s", client->arg.path);
+	int reLen = strlen(pathTmp);
+	
+	fprintf(stderr, "[reSyncRm] wait to recv path\n");
+	if (!recv_message(client->conn_fd, &pathTmp[reLen], rm->message.body.pathlen)){
+		fprintf(stderr, "[reSyncRm] fail to recv path\n");
+		exit(1);
+	}
+	pathTmp[reLen+rm->message.body.pathlen] = '\0';
+	if (remove(pathTmp) != 0){
+		perror("[reSyncRm] remove:");
+	}
+
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
+	header.res.op = CSIEBOX_PROTOCOL_OP_RM;
+	header.res.datalen = 0;
+	header.res.status = CSIEBOX_PROTOCOL_STATUS_OK;
+	send_message(client->conn_fd, &header, sizeof(header));
+	return;
+}
+
+static void handle_request(csiebox_client *client) {
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	while(recv_message(client->conn_fd, &header, sizeof(header))){
+		if (header.req.magic != CSIEBOX_PROTOCOL_MAGIC_REQ) {
+			fprintf(stderr, "not request\n");
+			break;
+		}
+		switch(header.req.op){
+			case CSIEBOX_PROTOCOL_OP_SYNC_META:
+				fprintf(stderr, "sync meta\n");
+				csiebox_protocol_meta meta;
+				if (complete_message_with_header(client->conn_fd, &header, &meta)) {
+					reSyncMeta(client, &meta);
+				}
+			break;
+			case CSIEBOX_PROTOCOL_OP_RM:
+				fprintf(stderr, "sync rm\n");
+				csiebox_protocol_rm rm;
+				if (complete_message_with_header(client->conn_fd, &header, &rm)) {
+					reSyncRm(client, &rm);
+				}
+			break;
+			case CSIEBOX_PROTOCOL_OP_SYNC_END:
+				fprintf(stderr, "sync end\n");
+				return;
+			break;
+			default:
+				fprintf(stderr, "unknown op %x\n", header.req.op);
+			break;
+		}
+	}
+	fprintf(stderr, "file download ended unexpectedly\n");
+}
+//this is where client sends request, you sould write your code here
+int csiebox_client_run(csiebox_client* client) {
+	if (!login(client)) {
+		fprintf(stderr, "login fail\n");
+		return 0;
+	}
+	fprintf(stderr, "login success\n");
+
+	handle_request(client);
+
+	int fd;
+	fd = inotify_init();
+	if((fd = inotify_init()) < 0){
+		fprintf(stderr, "fd init failed.\n");
+		exit(1);
+	}
+
+	if(!init_hash(&hashTable, 97)){
+		fprintf(stderr, "hash table init failed.\n");
+		exit(1);
+	}
+
+	traverse(client, fd);
+	fprintf(stderr, "==========traverse success========conn_fd : %d\n", client->conn_fd);
+	update(client, fd);
+
+	close(fd);
+	//====================
+	//        TODO
+	//====================
+
+
+	return 1;
+}
+
+void csiebox_client_destroy(csiebox_client** client) {
+	csiebox_client* tmp = *client;
+	*client = 0;
+	if (!tmp) {
+		return;
+	}
+	close(tmp->conn_fd);
+	free(tmp);
+}
+
+//read config file
+static int parse_arg(csiebox_client* client, int argc, char** argv) {
+	if (argc != 2) {
+		return 0;
+	}
+	FILE* file = fopen(argv[1], "r");
+	if (!file) {
+		return 0;
+	}
+	fprintf(stderr, "reading config...\n");
+	size_t keysize = 20, valsize = 20;
+	char* key = (char*)malloc(sizeof(char) * keysize);
+	char* val = (char*)malloc(sizeof(char) * valsize);
+	ssize_t keylen, vallen;
+	int accept_config_total = 5;
+	int accept_config[5] = {0, 0, 0, 0, 0};
+	while ((keylen = getdelim(&key, &keysize, '=', file) - 1) > 0) {
+		key[keylen] = '\0';
+		vallen = getline(&val, &valsize, file) - 1;
+		val[vallen] = '\0';
+		fprintf(stderr, "config (%d, %s)=(%d, %s)\n", keylen, key, vallen, val);
+		if (strcmp("name", key) == 0) {
+			if (vallen <= sizeof(client->arg.name)) {
+				strncpy(client->arg.name, val, vallen);
+				accept_config[0] = 1;
+			}
+		} else if (strcmp("server", key) == 0) {
+			if (vallen <= sizeof(client->arg.server)) {
+				strncpy(client->arg.server, val, vallen);
+				accept_config[1] = 1;
+			}
+		} else if (strcmp("user", key) == 0) {
+			if (vallen <= sizeof(client->arg.user)) {
+				strncpy(client->arg.user, val, vallen);
+				accept_config[2] = 1;
+			}
+		} else if (strcmp("passwd", key) == 0) {
+			if (vallen <= sizeof(client->arg.passwd)) {
+				strncpy(client->arg.passwd, val, vallen);
+				accept_config[3] = 1;
+			}
+		} else if (strcmp("path", key) == 0) {
+			if (vallen <= sizeof(client->arg.path)) {
+				strncpy(client->arg.path, val, vallen);
+				accept_config[4] = 1;
+			}
+		}
+	}
+	free(key);
+	free(val);
+	fclose(file);
+	int i, test = 1;
+	for (i = 0; i < accept_config_total; ++i) {
+		test = test & accept_config[i];
+	}
+	if (!test) {
+		fprintf(stderr, "config error\n");
+		return 0;
+	}
+	return 1;
+}
+
+static int login(csiebox_client* client) {
+	csiebox_protocol_login req;
+	memset(&req, 0, sizeof(req));
+	req.message.header.req.magic = CSIEBOX_PROTOCOL_MAGIC_REQ;
+	req.message.header.req.op = CSIEBOX_PROTOCOL_OP_LOGIN;
+	req.message.header.req.datalen = sizeof(req) - sizeof(req.message.header);
+	memcpy(req.message.body.user, client->arg.user, strlen(client->arg.user));
+	md5(client->arg.passwd,
+			strlen(client->arg.passwd),
+			req.message.body.passwd_hash);
+	if (!send_message(client->conn_fd, &req, sizeof(req))) {
+		fprintf(stderr, "send fail\n");
+		return 0;
+	}
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	if (recv_message(client->conn_fd, &header, sizeof(header))) {
+		if (header.res.magic == CSIEBOX_PROTOCOL_MAGIC_RES &&
+				header.res.op == CSIEBOX_PROTOCOL_OP_LOGIN &&
+				header.res.status == CSIEBOX_PROTOCOL_STATUS_OK) {
+			client->client_id = header.res.client_id;
+			return 1;
+		} else {
+			return 0;
+		}
+	}
+	return 0;
+}

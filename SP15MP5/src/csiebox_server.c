@@ -1,0 +1,697 @@
+#include "csiebox_server.h"
+
+#include "csiebox_common.h"
+#include "connect.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <utime.h>
+#include <signal.h>
+
+#define THREADMAX 32
+static int parse_arg(csiebox_server* server, int argc, char** argv);
+static void* threadRun(void *data);
+static void handle_request(csiebox_server* server, int conn_fd, fd_set *master, csiebox_protocol_header header, int busy);
+static void rejectJob(int conn_fd);
+static void blockJob(int conn_fd);
+static int get_account_info(csiebox_server* server,  const char* user, csiebox_account_info* info);
+static void login(csiebox_server* server, int conn_fd, csiebox_protocol_login* login, int busy);
+static void logout(csiebox_server* server, int conn_fd);
+static void sync_file(csiebox_server* server, int conn_fd, csiebox_protocol_meta* meta, int busy);
+static char* get_user_homedir(csiebox_server* server, csiebox_client_info* info);
+static void rm_file(csiebox_server* server, int conn_fd, csiebox_protocol_rm* rm, int busy);
+
+void csiebox_server_init(csiebox_server** server, int argc, char** argv) {
+	csiebox_server* tmp = (csiebox_server*)malloc(sizeof(csiebox_server));
+	if (!tmp) {
+		fprintf(stderr, "server malloc fail\n");
+		return;
+	}
+	memset(tmp, 0, sizeof(csiebox_server));
+	if (!parse_arg(tmp, argc, argv)) {
+		fprintf(stderr, "Usage: %s [config file] [-d]\n", argv[0]);
+		free(tmp);
+		return;
+	}
+
+	int fd = server_start();
+	if (fd < 0) {
+		fprintf(stderr, "server fail\n");
+		free(tmp);
+		return;
+	}
+	tmp->client = (csiebox_client_info**)malloc(sizeof(csiebox_client_info*) * getdtablesize());
+	if (!tmp->client) {
+		fprintf(stderr, "client list malloc fail\n");
+		close(fd);
+		free(tmp);
+		return;
+	}
+	memset(tmp->client, 0, sizeof(csiebox_client_info*) * getdtablesize());
+	tmp->listen_fd = fd;
+	*server = tmp;
+}
+
+void daemonize(csiebox_server *server){
+	pid_t pid = 0;
+	pid_t sid = 0;
+	pid = fork();
+	if (pid > 0) {
+		exit(0);
+	} 
+	else if (pid < 0) {
+		fprintf(stderr, "fail to fork\n");
+		exit(0);
+	}
+	umask(0);
+	sid = setsid();
+	if (sid < 0) {
+		fprintf(stderr, "fail to setsid\n");
+	}
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
+	close(STDERR_FILENO);
+	char logPath[PATH_MAX];
+	sprintf(logPath, "%s/log.txt\0", server->arg.run_path);
+	int fd = open(logPath, O_CREAT | O_WRONLY | O_TRUNC, REG_S_FLAG);
+	if (fd != STDERR_FILENO) {
+		dup2(fd, STDERR_FILENO);
+		close(fd);
+	}
+}
+
+int demandThread;
+pthread_mutex_t lock;
+pthread_cond_t broadcast;
+
+struct threadData{
+	csiebox_server *server;
+	csiebox_protocol_header header;
+	int conn_fd; 
+	int worker[1025]; 
+	int job;
+	int workload;
+	fd_set *master;
+};
+
+struct threadNum{
+	int num;
+	struct threadData *dataPtr;
+};
+
+struct threadData data;
+char run_path[PATH_MAX]; 
+
+void sig_int(int signum){
+	if (unlink(run_path) != 0) 
+		fprintf(stderr, "fail to unlink fifo\n");
+	exit(0);
+}
+
+void sig_term(int signum){
+	if (unlink(run_path) != 0) 
+		fprintf(stderr, "fail to unlink fifo\n");
+	exit(0);
+}
+
+void sig_usr1(int signum){
+	FILE *fp = fopen(run_path, "w");
+	if (fp == NULL) {
+		return;
+	}
+	uint32_t send = htonl((uint32_t)data.workload);
+	fwrite(&send, sizeof(uint32_t), 1, fp);
+	fclose(fp);
+}
+
+int csiebox_server_run(csiebox_server* server) {
+	if (server->arg.daemon) {
+		fprintf(stderr, "daemonize\n");
+		daemonize(server);
+		char serverPid[PATH_MAX];
+		sprintf(serverPid, "%s/csiebox_server.pid\0", server->arg.run_path);
+		FILE *fp = fopen(serverPid, "w");
+		if (fp == NULL) {
+			fprintf(stderr, "fail to open serverPid\n");
+		}
+		int pidTmp = (int)getpid();
+		fprintf(stderr, "daemon pid : %d\n", pidTmp);
+		fprintf(fp, "%d", pidTmp);
+		fclose(fp);
+	}
+	int pid = (int)getpid();
+	sprintf(run_path, "%s/fifo.%d\0", server->arg.run_path, pid);
+	fprintf(stderr, "fifo path : %s\n", run_path);
+	mkfifo(run_path, 0666);
+	
+	struct sigaction int_act;
+	memset(&int_act, 0, sizeof(struct sigaction));
+	int_act.sa_handler = &sig_int;
+	sigaction(SIGINT, &int_act, NULL);
+	memset(&int_act, 0, sizeof(struct sigaction));
+	int_act.sa_handler = &sig_term;
+	sigaction(SIGTERM, &int_act, NULL);
+	memset(&int_act, 0, sizeof(struct sigaction));
+	int_act.sa_handler = &sig_usr1;
+	sigaction(SIGUSR1, &int_act, NULL);
+
+	if (pthread_mutex_init(&lock, NULL) != 0 ||
+		pthread_cond_init(&broadcast, NULL) != 0){
+		fprintf(stderr, "fail to init mutex or cond\n");
+		exit(0);	
+	}
+	memset(&data, 0, sizeof(struct threadData));
+	pthread_t thread[THREADMAX];
+	if (demandThread > THREADMAX){
+		fprintf(stderr, "request too many threads\n");
+		demandThread = THREADMAX;
+	}
+	for(int i = 0; i < demandThread; i++){
+		if (pthread_create(&thread[i], NULL, threadRun, (void *)&(data)) != 0){
+			fprintf(stderr, "fail to create new thread\n");
+			exit(0);
+		}
+		fprintf(stderr, "create thread %d success\n", i);
+	}
+
+	fd_set master;
+	fd_set read_fds;
+	int fdmax = server->listen_fd;
+	FD_ZERO(&master);
+	FD_ZERO(&read_fds);
+	FD_SET(server->listen_fd, &master);	
+
+	int conn_fd, conn_len;
+	struct sockaddr_in addr;
+
+	data.master = &master;
+	data.server = server;
+	csiebox_protocol_header header;
+	while (1) {
+		read_fds = master;
+		if(select(fdmax+1, &read_fds, NULL, NULL, NULL) == -1){
+			perror("select");
+			continue;
+		}
+		memset(&addr, 0, sizeof(addr));
+		for(int i = 0; i <= fdmax; i++){
+			// waiting client connect
+			if (FD_ISSET(i, &read_fds)){
+				if (i == server->listen_fd){
+					conn_len = sizeof(addr);
+					conn_fd = accept(server->listen_fd, (struct sockaddr*)&addr, (socklen_t*)&conn_len);
+					if (conn_fd < 0) {
+						if (errno == ENFILE) {
+							fprintf(stderr, "out of file descriptor table\n");
+							continue;
+						} 
+						else if (errno == EAGAIN || errno == EINTR) {
+							continue;
+						} else {
+							fprintf(stderr, "accept err\n");
+							fprintf(stderr, "code: %s\n", strerror(errno));
+							break;
+						}
+					}
+					else{
+						fprintf(stderr, "new conn_fd = %d\n", conn_fd);
+						FD_SET(conn_fd, &master);
+						if(conn_fd > fdmax)
+							fdmax = conn_fd;
+					}
+				}
+				else{
+					// handle request from connected socket fd
+					int run = 1;
+					if (data.worker[i] == 1)
+						continue;
+					pthread_mutex_lock(&lock);
+					if (run){
+						memset(&header, 0, sizeof(header));
+						fprintf(stderr, "waiting...\n");
+						if (recv_message(i, &header, sizeof(header))) {
+							data.conn_fd = i;
+							if (data.workload >= demandThread){
+								fprintf(stderr, "data.workload = %d\n", data.workload);
+								handle_request(server, i, &master, header, 1);
+							}
+							else{
+								data.job++;
+								data.worker[i] = 1;
+								data.header = header;
+								fprintf(stderr, "data.job = %d\nworkload = %d\n", data.job, data.workload);
+								if (pthread_cond_signal(&broadcast) != 0){
+									fprintf(stderr, "fail to send pthread signal\n");
+									exit(0);
+								}
+							}
+						}
+						else{
+							logout(server, i);
+							FD_CLR(i, &master);
+							fprintf(stderr, "end of connection\n");
+						}
+					}
+					pthread_mutex_unlock(&lock);
+					//sleep(1);
+					//handle_request(server, i, &master);
+				}
+			}
+		}
+	}
+	return 1;
+}
+
+void csiebox_server_destroy(csiebox_server** server) {
+	csiebox_server* tmp = *server;
+	*server = 0;
+	if (!tmp) {
+		return;
+	}
+	close(tmp->listen_fd);
+	free(tmp->client);
+	free(tmp);
+}
+
+static int parse_arg(csiebox_server* server, int argc, char** argv) {
+	if (argc < 2 || argc > 3) {
+		return 0;
+	}
+	FILE* file = fopen(argv[1], "r");
+	if (!file) {
+		return 0;
+	}
+	fprintf(stderr, "reading config...\n");
+	size_t keysize = 20, valsize = 20;
+	char* key = (char*)malloc(sizeof(char) * keysize);
+	char* val = (char*)malloc(sizeof(char) * valsize);
+	ssize_t keylen, vallen;
+	int accept_config_total = 4;
+	int accept_config[4] = {0};
+	while ((keylen = getdelim(&key, &keysize, '=', file) - 1) > 0) {
+		key[keylen] = '\0';
+		vallen = getline(&val, &valsize, file) - 1;
+		val[vallen] = '\0';
+		fprintf(stderr, "config (%zd, %s)=(%zd, %s)\n", keylen, key, vallen, val);
+		if (strcmp("path", key) == 0) {
+			if (vallen <= sizeof(server->arg.path)) {
+				strncpy(server->arg.path, val, vallen);
+				accept_config[0] = 1;
+			}
+		} else if (strcmp("account_path", key) == 0) {
+			if (vallen <= sizeof(server->arg.account_path)) {
+				strncpy(server->arg.account_path, val, vallen);
+				accept_config[1] = 1;
+			}
+		} else if (strcmp("thread", key) == 0) {
+			if (THREADMAX >= atoi(val)){
+				demandThread = atoi(val);
+				accept_config[2] = 1;			
+			}
+		} else if (strcmp("run_path", key) == 0) {
+			if (vallen <= sizeof(server->arg.run_path)) {
+				strncpy(server->arg.run_path, val, vallen);
+				accept_config[3] = 1;
+			}
+		}
+	}
+	free(key);
+	free(val);
+	fclose(file);
+	int i, test = 1;
+	for (i = 0; i < accept_config_total; ++i) {
+		test = test & accept_config[i];
+	}
+	if (!test) {
+		fprintf(stderr, "config error\n");
+		return 0;
+	}
+	if (argv[2] != NULL && strlen(argv[2]) == 2 && strncmp("-d", argv[2], 2) == 0) 
+		server->arg.daemon = 1;
+	return 1;
+}
+
+static void *threadRun(void *data){
+	struct threadData *tmp = (struct threadData *)data;
+	while(1){
+		pthread_mutex_lock(&lock);
+		while(tmp->job == 0){
+			pthread_cond_wait(&broadcast, &lock);
+		}
+		tmp->workload++;
+		csiebox_server *server = tmp->server;
+		csiebox_protocol_header header = tmp->header;
+		int conn_fd = tmp->conn_fd;
+		fd_set *master = tmp->master; 
+		tmp->job--;
+		pthread_mutex_unlock(&lock);
+		handle_request(server, conn_fd, master, header, 0);
+		tmp->workload--;
+		tmp->worker[conn_fd] = 0;
+	}
+	return NULL;
+}
+
+static void handle_request(csiebox_server* server, int conn_fd, fd_set *master, csiebox_protocol_header header, int busy) {
+	if (header.req.magic != CSIEBOX_PROTOCOL_MAGIC_REQ) {
+		fprintf(stderr, "header magic is not req\n");	 
+	}
+	switch (header.req.op) {
+		case CSIEBOX_PROTOCOL_OP_LOGIN:
+			fprintf(stderr, "login\n");
+			csiebox_protocol_login req;
+			if (complete_message_with_header(conn_fd, &header, &req)) {
+				login(server, conn_fd, &req, busy);
+			}
+			break;
+		case CSIEBOX_PROTOCOL_OP_SYNC_META:
+			fprintf(stderr, "sync meta\n");
+			csiebox_protocol_meta meta;
+			if (complete_message_with_header(conn_fd, &header, &meta)) {
+				sync_file(server, conn_fd, &meta, busy);
+			}
+			break;
+		case CSIEBOX_PROTOCOL_OP_SYNC_END:
+			//sleep(1);
+			fprintf(stderr, "sync end\n");
+			break;
+		case CSIEBOX_PROTOCOL_OP_RM:
+			fprintf(stderr, "rm\n");
+			csiebox_protocol_rm rm;
+			if (complete_message_with_header(conn_fd, &header, &rm)) {
+				rm_file(server, conn_fd, &rm, busy);
+			}
+			break;
+		default:
+			fprintf(stderr, "unknow op %x\n", header.req.op);
+			break;
+	}    
+}
+
+static void rejectJob(int conn_fd){
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
+	header.res.op = CSIEBOX_PROTOCOL_OP_LOGIN;
+	header.res.datalen = 0;
+	header.res.client_id = conn_fd;
+	header.res.status = CSIEBOX_PROTOCOL_STATUS_BUSY;
+	send_message(conn_fd, &header, sizeof(header));
+}
+
+static void blockJob(int conn_fd){
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
+	header.res.op = CSIEBOX_PROTOCOL_OP_LOGIN;
+	header.res.datalen = 0;
+	header.res.client_id = conn_fd;
+	header.res.status = CSIEBOX_PROTOCOL_STATUS_BLOCK;
+	send_message(conn_fd, &header, sizeof(header));
+}
+
+static int get_account_info(
+		csiebox_server* server,  const char* user, csiebox_account_info* info) {
+	FILE* file = fopen(server->arg.account_path, "r");
+	if (!file) {
+		return 0;
+	}
+	size_t buflen = 100;
+	char* buf = (char*)malloc(sizeof(char) * buflen);
+	memset(buf, 0, buflen);
+	ssize_t len;
+	int ret = 0;
+	int line = 0;
+	while ((len = getline(&buf, &buflen, file) - 1) > 0) {
+		++line;
+		buf[len] = '\0';
+		char* u = strtok(buf, ",");
+		if (!u) {
+			fprintf(stderr, "ill form in account file, line %d\n", line);
+			continue;
+		}
+		if (strcmp(user, u) == 0) {
+			memcpy(info->user, user, strlen(user));
+			char* passwd = strtok(NULL, ",");
+			if (!passwd) {
+				fprintf(stderr, "ill form in account file, line %d\n", line);
+				continue;
+			}
+			md5(passwd, strlen(passwd), info->passwd_hash);
+			ret = 1;
+			break;
+		}
+	}
+	free(buf);
+	fclose(file);
+	return ret;
+}
+
+static void login(csiebox_server* server, int conn_fd, csiebox_protocol_login* login, int busy) {
+	if (busy) {
+		rejectJob(conn_fd);
+		return;
+	}
+	int succ = 1;
+	csiebox_client_info* info = (csiebox_client_info*)malloc(sizeof(csiebox_client_info));
+	memset(info, 0, sizeof(csiebox_client_info));
+	if (!get_account_info(server, login->message.body.user, &(info->account))) {
+		fprintf(stderr, "cannot find account\n");
+		succ = 0;
+	}
+	if (succ &&
+			memcmp(login->message.body.passwd_hash,
+				info->account.passwd_hash,
+				MD5_DIGEST_LENGTH) != 0) {
+		fprintf(stderr, "passwd miss match\n");
+		succ = 0;
+	}
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
+	header.res.op = CSIEBOX_PROTOCOL_OP_LOGIN;
+	header.res.datalen = 0;
+	if (succ) {
+		if (server->client[conn_fd]) {
+			free(server->client[conn_fd]);
+		}
+		info->conn_fd = conn_fd;
+		server->client[conn_fd] = info;
+		header.res.status = CSIEBOX_PROTOCOL_STATUS_OK;
+		header.res.client_id = info->conn_fd;
+		char* homedir = get_user_homedir(server, info);
+		mkdir(homedir, DIR_S_FLAG);
+		free(homedir);
+	} else {
+		header.res.status = CSIEBOX_PROTOCOL_STATUS_FAIL;
+		free(info);
+	}
+	send_message(conn_fd, &header, sizeof(header));
+}
+
+static void logout(csiebox_server* server, int conn_fd) {
+	free(server->client[conn_fd]);
+	server->client[conn_fd] = 0;
+	close(conn_fd);
+}
+
+static void sync_file(csiebox_server* server, int conn_fd, csiebox_protocol_meta* meta, int busy) {
+	csiebox_client_info* info = server->client[conn_fd];
+	char* homedir = get_user_homedir(server, info);
+	fprintf(stderr, "homedir = %s\n", homedir);
+	char buf[PATH_MAX], req_path[PATH_MAX];
+	memset(buf, 0, PATH_MAX);
+	memset(req_path, 0, PATH_MAX);
+	recv_message(conn_fd, buf, meta->message.body.pathlen);
+	sprintf(req_path, "%s%s", homedir, buf);
+	free(homedir);
+	if (busy){
+		rejectJob(conn_fd);
+		return;
+	}
+
+	fprintf(stderr, "req_path: %s\n", req_path);
+	struct stat stat;
+	memset(&stat, 0, sizeof(struct stat));
+
+	struct flock lock = {F_WRLCK, SEEK_SET, 0, 0, 0}, rtest, wtest;
+	lock.l_pid = getpid();
+	rtest = lock;
+	wtest = lock;
+	rtest.l_type = F_RDLCK;
+	int lockFd;
+	int need_data = 0, change = 0;
+	lockFd = open(req_path, O_RDWR);
+	if (lstat(req_path, &stat) < 0) {
+		need_data = 1;
+		change = 1;
+	} else { 					
+		if(stat.st_mode != meta->message.body.stat.st_mode) { 
+			chmod(req_path, meta->message.body.stat.st_mode);
+		}				
+		if(stat.st_atime != meta->message.body.stat.st_atime ||
+				stat.st_mtime != meta->message.body.stat.st_mtime){
+			struct utimbuf* buf = (struct utimbuf*)malloc(sizeof(struct utimbuf));
+			buf->actime = meta->message.body.stat.st_atime;
+			buf->modtime = meta->message.body.stat.st_mtime;
+			if(utime(req_path, buf)!=0){
+				fprintf(stderr, "time fail\n");
+			}
+		}
+		uint8_t hash[MD5_DIGEST_LENGTH];
+		memset(hash, 0, MD5_DIGEST_LENGTH);
+		if ((stat.st_mode & S_IFMT) == S_IFDIR) {
+		} else {
+			if (lockFd < 0) {
+				fprintf(stderr, "fail to open\n");
+			}
+			fcntl(lockFd, F_GETLK, &rtest);
+			fcntl(lockFd, F_GETLK, &wtest);
+			if (wtest.l_type != F_UNLCK) {
+				blockJob(conn_fd);
+				close(lockFd);
+				return;
+			}
+			if (fcntl(lockFd, F_SETLKW, &lock) < 0) {
+				fprintf(stderr, "fail to lock the file\n");
+			}
+			md5_file(req_path, hash, lockFd);
+		}
+		if (memcmp(hash, meta->message.body.hash, MD5_DIGEST_LENGTH) != 0) {
+			need_data = 1;
+		}
+	}
+
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
+	header.res.op = CSIEBOX_PROTOCOL_OP_SYNC_META;
+	header.res.datalen = 0;
+	header.res.client_id = conn_fd;
+	if (need_data) {
+		header.res.status = CSIEBOX_PROTOCOL_STATUS_MORE;
+	} else {
+		header.res.status = CSIEBOX_PROTOCOL_STATUS_OK;
+	}
+	send_message(conn_fd, &header, sizeof(header));
+	if (lockFd > 0){
+		lock.l_type = F_UNLCK;
+		fcntl(lockFd, F_SETLK, &lock);
+		close(lockFd);
+	}
+	if (need_data) {
+		int fd = open(req_path, O_CREAT | O_WRONLY | O_TRUNC, REG_S_FLAG);
+		csiebox_protocol_file file;
+		memset(&file, 0, sizeof(file));
+		recv_message(conn_fd, &file, sizeof(file));
+		fprintf(stderr, "sync file: %zd\n", file.message.body.datalen);
+		if (file.message.header.req.op != CSIEBOX_PROTOCOL_OP_SYNC_FILE) {
+			fprintf(stderr, "get wrong header\n");
+		}
+		if ((meta->message.body.stat.st_mode & S_IFMT) == S_IFDIR) {
+			fprintf(stderr, "dir\n");
+			mkdir(req_path, DIR_S_FLAG);
+		} else {
+			fprintf(stderr, "regular file\n");
+			if (fd > 0){
+				lock.l_type = F_WRLCK;
+				if (fcntl(fd, F_SETLKW, &lock) < 0) {
+					fprintf(stderr, "fail to lock the file\n");
+				}
+			}
+			size_t total = 0, readlen = 0;
+			char buf[4096];
+			memset(buf, 0, 4096);
+			while (file.message.body.datalen > total) {
+				if (file.message.body.datalen - total < 4096) {
+					readlen = file.message.body.datalen - total;
+				} else {
+					readlen = 4096;
+				}
+				if (!recv_message(conn_fd, buf, readlen)) {
+					fprintf(stderr, "file broken\n");
+					break;
+				}
+				total += readlen;
+				if (fd > 0) {
+					write(fd, buf, readlen);
+				}
+			}
+		}
+		if (fd > 0) {
+			lock.l_type = F_UNLCK;
+			fcntl(fd, F_SETLK, &lock);
+			close(fd);
+		}
+		if (change) {
+			chmod(req_path, meta->message.body.stat.st_mode);
+			struct utimbuf* buf = (struct utimbuf*)malloc(sizeof(struct utimbuf));
+			buf->actime = meta->message.body.stat.st_atime;
+			buf->modtime = meta->message.body.stat.st_mtime;
+			utime(req_path, buf);
+		}
+		header.res.op = CSIEBOX_PROTOCOL_OP_SYNC_FILE;
+		header.res.status = CSIEBOX_PROTOCOL_STATUS_OK;
+		send_message(conn_fd, &header, sizeof(header));
+	}
+}
+
+static char* get_user_homedir(csiebox_server* server, csiebox_client_info* info) {
+	char* ret = (char*)malloc(sizeof(char) * PATH_MAX);
+	memset(ret, 0, PATH_MAX);
+	sprintf(ret, "%s/%s", server->arg.path, info->account.user);
+	return ret;
+}
+
+static void rm_file(csiebox_server* server, int conn_fd, csiebox_protocol_rm* rm, int busy) {
+	csiebox_client_info* info = server->client[conn_fd];
+	char* homedir = get_user_homedir(server, info);
+	char req_path[PATH_MAX], buf[PATH_MAX];
+	memset(req_path, 0, PATH_MAX);
+	memset(buf, 0, PATH_MAX);
+	recv_message(conn_fd, buf, rm->message.body.pathlen);
+	sprintf(req_path, "%s%s", homedir, buf);
+	free(homedir);
+	if (busy){
+		rejectJob(conn_fd);
+		return;
+	}
+	fprintf(stderr, "rm (%zd, %s)\n", strlen(req_path), req_path);
+	struct stat stat;
+	memset(&stat, 0, sizeof(stat));
+	if (lstat(req_path, &stat) == 0) {
+		if ((stat.st_mode & S_IFMT) == S_IFDIR) {
+			rmdir(req_path);
+		} else {
+			struct flock lock = {F_WRLCK, SEEK_SET, 0, 0, 0};
+			lock.l_pid = getpid();
+			int fd = open(req_path, O_WRONLY);
+			fcntl(fd, F_GETLK, &lock);
+			if (lock.l_type != F_UNLCK) {
+				blockJob(conn_fd);
+				close(fd);
+				return;
+			}
+			close(fd);
+			unlink(req_path);
+		}
+	}
+	csiebox_protocol_header header;
+	memset(&header, 0, sizeof(header));
+	header.res.magic = CSIEBOX_PROTOCOL_MAGIC_RES;
+	header.res.op = CSIEBOX_PROTOCOL_OP_RM;
+	header.res.datalen = 0;
+	header.res.client_id = conn_fd;
+	header.res.status = CSIEBOX_PROTOCOL_STATUS_OK;
+	send_message(conn_fd, &header, sizeof(header));
+}
